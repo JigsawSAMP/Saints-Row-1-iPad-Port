@@ -1,0 +1,58 @@
+cmake_minimum_required(VERSION 3.25)
+project(SaintsRowIPad LANGUAGES C CXX OBJC OBJCXX)
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    message(FATAL_ERROR "This target is for iPadOS. Build the host recompiler separately.")
+endif()
+set(REXGLUE_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+set(REXGLUE_ENABLE_TRACY OFF CACHE BOOL "" FORCE)
+set(REXGLUE_ENABLE_PERF_COUNTERS OFF CACHE BOOL "" FORCE)
+set(REX_OUT_DIR "${CMAKE_BINARY_DIR}/products" CACHE PATH "" FORCE)
+set(CPM_SOURCE_CACHE "${CMAKE_BINARY_DIR}/cpm-cache" CACHE PATH "" FORCE)
+add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../PortDependencies/rexglue-sdk" sdk)
+set(SR_GENERATED_DIR "${CMAKE_CURRENT_LIST_DIR}/../SaintsReborn/build/generated")
+if(NOT EXISTS "${SR_GENERATED_DIR}/sources.cmake")
+    message(FATAL_ERROR "Run the host codegen step before building guest code.")
+endif()
+include("${SR_GENERATED_DIR}/sources.cmake")
+# Generated guest CPU code is linked into the native runtime bridge below.
+add_library(sr_guest_code STATIC ${GENERATED_SOURCES})
+target_link_libraries(sr_guest_code PUBLIC rex::runtime)
+target_include_directories(sr_guest_code PRIVATE "${SR_GENERATED_DIR}")
+target_compile_features(sr_guest_code PRIVATE cxx_std_23)
+target_compile_options(sr_guest_code PRIVATE -O2 -fno-strict-aliasing -ffp-model=precise -ffp-contract=off -fno-char8_t)
+target_precompile_headers(sr_guest_code PRIVATE "${SR_GENERATED_DIR}/saintsrow_pch.h")
+add_library(sr_apple_input STATIC AppleInputDriver.cpp
+    "${CMAKE_CURRENT_LIST_DIR}/../Saints Row 1/Saints Row 1/SRInput.cpp")
+target_include_directories(sr_apple_input PUBLIC "${CMAKE_CURRENT_LIST_DIR}"
+    "${CMAKE_CURRENT_LIST_DIR}/../Saints Row 1/Saints Row 1")
+target_link_libraries(sr_apple_input PUBLIC rex::runtime)
+target_compile_features(sr_apple_input PRIVATE cxx_std_23)
+
+add_library(sr_game_hooks STATIC "${CMAKE_CURRENT_LIST_DIR}/../SaintsReborn/project/src/stubs.cpp")
+target_link_libraries(sr_game_hooks PUBLIC rex::runtime)
+target_include_directories(sr_game_hooks PRIVATE "${SR_GENERATED_DIR}"
+    "${CMAKE_CURRENT_LIST_DIR}/../SaintsReborn/project/src")
+target_compile_features(sr_game_hooks PRIVATE cxx_std_23)
+target_precompile_headers(sr_game_hooks PRIVATE "${SR_GENERATED_DIR}/saintsrow_pch.h")
+
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+execute_process(COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/prepare_coop.py" "${CMAKE_BINARY_DIR}/coop" COMMAND_ERROR_IS_FATAL ANY)
+add_library(SRGameBridge SHARED NativeGame.cpp NativeCoreServices.cpp NativeRenderFixes.cpp NativePresentation.mm NativeCoop.cpp MobileControls.cpp NativeMobileGame.cpp NativeMenus.cpp MultiplayerSession.cpp "${CMAKE_BINARY_DIR}/coop/AppleCoop.cpp")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS prepare_coop.py "${CMAKE_CURRENT_LIST_DIR}/../SaintsReborn/core/WhompaysCoop/coop.cpp")
+target_include_directories(SRGameBridge PRIVATE "${CMAKE_BINARY_DIR}/coop" "${CMAKE_CURRENT_LIST_DIR}" "${CMAKE_CURRENT_LIST_DIR}/../SaintsReborn/modding/include" "${CMAKE_CURRENT_LIST_DIR}/../SaintsReborn/core/WhompaysCoop")
+set_source_files_properties(NativePresentation.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+target_include_directories(SRGameBridge PRIVATE "${SR_GENERATED_DIR}"
+    "${CMAKE_CURRENT_LIST_DIR}/../SaintsReborn/project/src")
+target_link_libraries(SRGameBridge PRIVATE sr_guest_code sr_apple_input rex::runtime rexgpu-xenos)
+target_link_options(SRGameBridge PRIVATE "LINKER:-force_load,$<TARGET_FILE:sr_game_hooks>")
+add_dependencies(SRGameBridge sr_game_hooks)
+target_compile_features(SRGameBridge PRIVATE cxx_std_23)
+set_target_properties(SRGameBridge PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/products")
+
+set_target_properties(MoltenVK PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/products")
+target_link_libraries(MoltenVK PRIVATE "-framework CoreGraphics")
+
+set_property(TARGET MoltenVK PROPERTY VERSION)
+set_property(TARGET MoltenVK PROPERTY SOVERSION)
+
+target_sources(rexgpu-xenos PRIVATE "${CMAKE_CURRENT_LIST_DIR}/NativeGpuLifecycle.cpp")

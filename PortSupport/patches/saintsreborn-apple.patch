@@ -1,0 +1,52 @@
+diff --git a/project/src/stubs.cpp b/project/src/stubs.cpp
+index f18f04a..e025b54 100644
+--- a/project/src/stubs.cpp
++++ b/project/src/stubs.cpp
+@@ -27,8 +27,10 @@
+ #include <thread>
+ #include <unordered_map>
+ 
++#ifdef _WIN32
+ #include <windows.h>
+ #include <tlhelp32.h>
++#endif
+ 
+ // ============================================================================
+ // Helpers
+@@ -105,6 +107,7 @@ PPC_FUNC(sub_825E54A8) {
+     // In the background, with a second copy on the same PC, run at 30 at
+     // most, so two copies don't fight over the GPU and stall each other.
+     {
++#ifdef _WIN32
+         static uint32_t focus_check = 0;
+         static bool background = false;
+         if ((focus_check++ & 15) == 0) {
+@@ -123,6 +126,10 @@ PPC_FUNC(sub_825E54A8) {
+             }
+             background = now_background;
+         }
++#else
++        // iPad lifecycle suspension is handled by the application host.
++        constexpr bool background = false;
++#endif
+         int cap = sr::g_fps_cap.load(std::memory_order_relaxed);
+         // Cutscenes: above 60 fps the player model falls behind (the camera,
+         // dialogue and other actors run on real time, the player on frame
+@@ -142,6 +149,7 @@ PPC_FUNC(sub_825E54A8) {
+         // host tabbing out slowed its whole world (frame times past the
+         // game's own step limit), and the other player's copies of its people
+         // and cars tried to keep walking and jittered.
++#ifdef _WIN32
+         static bool other_copy = false;
+         if ((focus_check & 511) == 1) {
+             int copies = 0;
+@@ -155,6 +163,9 @@ PPC_FUNC(sub_825E54A8) {
+             }
+             other_copy = copies >= 2;
+         }
++#else
++        constexpr bool other_copy = false;
++#endif
+         if (background && other_copy && (cap > 30 || cap == 0)) cap = 30;
+         sr::LimitFrameRate(double(cap));
+     }

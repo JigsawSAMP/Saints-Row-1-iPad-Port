@@ -1,0 +1,843 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -18,6 +18,12 @@
+ #==========================================================
+ # Build Options
+ #==========================================================
++if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
++    set(REXGLUE_TOOLS_DEFAULT OFF)
++else()
++    set(REXGLUE_TOOLS_DEFAULT ON)
++endif()
++option(REXGLUE_BUILD_TOOLS "Build host code-generation tools" ${REXGLUE_TOOLS_DEFAULT})
+ option(REXGLUE_BUILD_TESTS       "Build PPC instruction and unit tests" OFF)
+ option(REXGLUE_ENABLE_SANITIZERS "Enable UndefinedBehaviorSanitizer" OFF)
+ option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (experimental)" OFF)
+@@ -180,6 +186,11 @@
+     message(FATAL_ERROR "Unsupported platform. ReXGlue supports Windows, Linux, and macOS only.")
+ endif()
+ 
++if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
++    set(REX_PLATFORM "ios-${REX_TARGET_PROCESSOR}")
++    add_compile_definitions(REX_PLATFORM_IOS=1)
++endif()
++
+ # Build config as compile definition (multi-config generators don't know config at configure time)
+ add_compile_definitions(REXGLUE_BUILD_CONFIG="$<CONFIG>")
+ 
+@@ -264,8 +275,10 @@
+ add_subdirectory(src/graphics)
+ add_subdirectory(src/system)
+ add_subdirectory(src/kernel)
+-add_subdirectory(src/codegen)
+-add_subdirectory(src/rexglue)
++if(REXGLUE_BUILD_TOOLS)
++    add_subdirectory(src/codegen)
++    add_subdirectory(src/rexglue)
++endif()
+ 
+ # Add tests subdirectory if tests are enabled
+ if(REXGLUE_BUILD_TESTS)
+@@ -291,13 +304,15 @@
+ message(STATUS "===========================================")
+ 
+ # SDK install/export rules (skipped when consumed as a subdirectory)
+-if(PROJECT_IS_TOP_LEVEL)
++if(PROJECT_IS_TOP_LEVEL AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+     include(cmake/rexglue_devenv.cmake)
+     include(cmake/rexglue_install.cmake)
+ else()
+     # When consumed via add_subdirectory(), provide the same interface as find_package().
+     # This sets REXGLUE_SHARE_DIR and makes rexglue_configure_target() available.
+-    set(REXGLUE_SHARE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/ui" PARENT_SCOPE)
++    if(NOT PROJECT_IS_TOP_LEVEL)
++        set(REXGLUE_SHARE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/ui" PARENT_SCOPE)
++    endif()
+     set(REXGLUE_SHARE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/ui")
+     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/rexglue_helpers.cmake)
+ endif()
+diff --git a/include/rex/platform/fpscr.h b/include/rex/platform/fpscr.h
+--- a/include/rex/platform/fpscr.h
++++ b/include/rex/platform/fpscr.h
+@@ -75,7 +75,10 @@
+     return csr;
+   }
+ 
+-  static inline void setcsr(u32 csr) noexcept { __asm__ __volatile__("msr fpcr, %0" : : "r"(csr)); }
++  static inline void setcsr(u32 csr) noexcept {
++    const u64 value = csr;
++    __asm__ __volatile__("msr fpcr, %0" : : "r"(value));
++  }
+ 
+   static inline void InitHostExceptions(u32& csr) noexcept {
+     csr &= ~ExceptionMask;  // Clear enable bits to disable exceptions
+diff --git a/include/rex/sr_platform_export.h b/include/rex/sr_platform_export.h
+new file mode 100644
+--- /dev/null
++++ b/include/rex/sr_platform_export.h
+@@ -0,0 +1,6 @@
++#pragma once
++#ifdef _WIN32
++#define SR_NATIVE_EXPORT extern "C" __declspec(dllexport)
++#else
++#define SR_NATIVE_EXPORT extern "C" __attribute__((visibility("default")))
++#endif
+diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
+--- a/include/rex/ui/presenter.h
++++ b/include/rex/ui/presenter.h
+@@ -390,6 +390,8 @@
+     // Refused for internal reasons or a host API side failure, but still may
+     // try to present without resetting the graphics provider in the future.
+     kNotPresented,
++    // GPU work is pending; retry without blocking the UI thread.
++    kNotPresentedGpuBusy,
+     kNotPresentedConnectionOutdated,
+     kGpuLostExternally,
+     kGpuLostResponsible,
+diff --git a/include/rex/ui/windowed_app_context_sdl.h b/include/rex/ui/windowed_app_context_sdl.h
+--- a/include/rex/ui/windowed_app_context_sdl.h
++++ b/include/rex/ui/windowed_app_context_sdl.h
+@@ -35,6 +35,7 @@
+   void PlatformQuitFromUIThread() override;
+ 
+   int RunMainMessageLoop();
++  void PumpEvents();
+ 
+   // Custom SDL event type carrying a coalesced paint request for a window
+   // (user.windowID identifies the target).
+diff --git a/src/codegen/builders/system.cpp b/src/codegen/builders/system.cpp
+--- a/src/codegen/builders/system.cpp
++++ b/src/codegen/builders/system.cpp
+@@ -30,23 +30,18 @@
+   return true;
+ }
+ 
+-bool build_sync(BuilderContext& ctx) {
+-  // Memory barrier, x86 has strong ordering so this is a no-op
+-  (void)ctx;
+-  return true;
+-}
+-
+-bool build_lwsync(BuilderContext& ctx) {
+-  // Lightweight memory barrier, x86 has strong ordering so this is a no-op
+-  (void)ctx;
+-  return true;
+-}
+-
+-bool build_eieio(BuilderContext& ctx) {
+-  // Enforce in-order execution of I/O, x86 has strong ordering so this is a no-op
+-  (void)ctx;
+-  return true;
+-}
++// The generated memory accesses are volatile, but ARM64 also needs the
++// ordering barriers used by the Xenon job queues. x86-only no-ops can lose
++// wakeups when shared work is published before its data becomes visible.
++static bool build_memory_barrier(BuilderContext& ctx) {
++  ctx.println("#if defined(__aarch64__) || defined(_M_ARM64)");
++  ctx.println("\tstd::atomic_thread_fence(std::memory_order_seq_cst);");
++  ctx.println("#endif");
++  return true;
++}
++bool build_sync(BuilderContext& ctx) { return build_memory_barrier(ctx); }
++bool build_lwsync(BuilderContext& ctx) { return build_memory_barrier(ctx); }
++bool build_eieio(BuilderContext& ctx) { return build_memory_barrier(ctx); }
+ 
+ bool build_db16cyc(BuilderContext& ctx) {
+   // Xenon-specific 16-cycle delay hint, no effect in recompiled code
+diff --git a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -16,12 +16,18 @@
+ #include <fstream>
+ #include <functional>
+ #include <string>
++#include <vector>
+ 
+ #include <fcntl.h>
+ 
+ #if REX_PLATFORM_MAC
+ #include <mach/mach.h>
++#include <TargetConditionals.h>
++#if TARGET_OS_IPHONE
++#include <mach/vm_map.h>
++#else
+ #include <mach/mach_vm.h>
++#endif
+ #include <mach/vm_region.h>
+ #endif  // REX_PLATFORM_MAC
+ 
+@@ -375,24 +381,37 @@
+ 
+ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
+ #if REX_PLATFORM_MAC
+-  mach_vm_address_t address = reinterpret_cast<mach_vm_address_t>(base_address);
+-  mach_vm_size_t region_size = 0;
++#if TARGET_OS_IPHONE
++  using RegionAddress = vm_address_t;
++  using RegionSize = vm_size_t;
++#else
++  using RegionAddress = mach_vm_address_t;
++  using RegionSize = mach_vm_size_t;
++#endif
++  RegionAddress address = reinterpret_cast<RegionAddress>(base_address);
++  RegionSize region_size = 0;
+   vm_region_basic_info_data_64_t info;
+   mach_msg_type_number_t info_count = VM_REGION_BASIC_INFO_COUNT_64;
+-  mach_port_t object_name;
++  mach_port_t object_name = MACH_PORT_NULL;
+ 
+   kern_return_t kr =
+-      mach_vm_region(mach_task_self(), &address, &region_size, VM_REGION_BASIC_INFO_64,
++#if TARGET_OS_IPHONE
++      vm_region_64
++#else
++      mach_vm_region
++#endif
++      (mach_task_self(), &address, &region_size, VM_REGION_BASIC_INFO_64,
+                      reinterpret_cast<vm_region_info_t>(&info), &info_count, &object_name);
++  if (object_name != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object_name);
+   if (kr != KERN_SUCCESS) {
+     return false;
+   }
+-  if (address > reinterpret_cast<mach_vm_address_t>(base_address)) {
++  if (address > reinterpret_cast<RegionAddress>(base_address)) {
+     return false;
+   }
+ 
+   length = static_cast<size_t>((address + region_size) -
+-                               reinterpret_cast<mach_vm_address_t>(base_address));
++                               reinterpret_cast<RegionAddress>(base_address));
+ 
+   if ((info.protection & (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE)) ==
+       (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE)) {
+@@ -474,13 +493,25 @@
+   }
+   oflag |= O_CREAT;
+   auto full_path = MakeShmName(path);
++#if TARGET_OS_IPHONE
++  // iPad apps cannot create global POSIX shared-memory objects. Use a private
++  // sparse file, immediately unlinked, while all aliases share its descriptor.
++  auto temp = (std::filesystem::temp_directory_path() / "sr-memory-XXXXXX").string();
++  std::vector<char> name(temp.begin(), temp.end());
++  name.push_back(0);
++  int ret = mkstemp(name.data());
++  if (ret >= 0) unlink(name.data());
++#else
+   int ret = shm_open(full_path.c_str(), oflag, 0777);
++#endif
+   if (ret < 0) {
+     return kFileMappingHandleInvalid;
+   }
+   if (rex_ftruncate64(ret, static_cast<off_t>(length)) != 0) {
+     close(ret);
++#if !TARGET_OS_IPHONE
+     shm_unlink(full_path.c_str());
++#endif
+     return kFileMappingHandleInvalid;
+   }
+   return static_cast<FileMappingHandle>(ret);
+@@ -489,7 +520,7 @@
+ 
+ void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::path& path) {
+   close(static_cast<int>(handle));
+-#if !REX_PLATFORM_ANDROID
++#if !REX_PLATFORM_ANDROID && !TARGET_OS_IPHONE
+   auto full_path = MakeShmName(path);
+   shm_unlink(full_path.c_str());
+ #endif
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -414,8 +414,12 @@
+       if (timeout == std::chrono::milliseconds::max()) {
+         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+       } else {
+-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
+-        auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
++        // Alertable waits use 1 ms slices. Rounding the remaining interval
++        // down to milliseconds made it zero almost immediately, busy-spinning
++        // across every audio wait slice. Preserve sub-millisecond precision.
++        auto remaining = end_time - now;
++        auto sleep_time = std::min(remaining, std::chrono::duration_cast<
++            std::chrono::steady_clock::duration>(std::chrono::milliseconds(1)));
+         std::this_thread::sleep_for(sleep_time);
+       }
+     }
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -1,3 +1,4 @@
++#include <chrono>
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -89,7 +90,7 @@
+ #endif
+   const uint32_t log2 = page_size_log2_;
+   const size_t page_size = size_t(1) << log2;
+-  uint64_t last_log = GetTickCount64();
++  uint64_t last_log = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+   std::vector<uint32_t> pages;
+   for (;;) {
+     {
+@@ -140,7 +141,7 @@
+       std::lock_guard<std::mutex> lock(verifier_mutex_);
+       verifier_busy_ = false;
+     }
+-    const uint64_t now = GetTickCount64();
++    const uint64_t now = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+     if (now - last_log >= 10000) {
+       const double seconds = double(now - last_log) / 1000.0;
+       last_log = now;
+@@ -896,7 +897,7 @@
+     auto& e = inv_stats[k];
+     ++e[0];
+     e[1] = exact_range ? 1 : 0;
+-    const uint64_t now = GetTickCount64();
++    const uint64_t now = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+     if (!inv_stats_tick) inv_stats_tick = now;
+     if (now - inv_stats_tick >= 10000) {
+       const double seconds = double(now - inv_stats_tick) / 1000.0;
+diff --git a/src/kernel/xam/apps/xgi_live.inc b/src/kernel/xam/apps/xgi_live.inc
+--- a/src/kernel/xam/apps/xgi_live.inc
++++ b/src/kernel/xam/apps/xgi_live.inc
+@@ -1,3 +1,4 @@
++#include <rex/sr_platform_export.h>
+ // Saints Reborn: Xbox Live sessions over Epic Online Services (included by
+ // xgi_app.cpp; only active with the cvar xam_signed_in_to_live).
+ //
+@@ -223,7 +224,7 @@
+   std::vector<Advert> found;
+   std::vector<std::pair<uint32_t, uint32_t>> wanted;
+   for (uint32_t i = 0; ctx_ptr && i < num_ctx && i < 32; ++i) {
+-    auto* c = memory->TranslateVirtual<uint8_t*>(ctx_ptr + i * 8);
++    auto* c = memory->template TranslateVirtual<uint8_t*>(ctx_ptr + i * 8);
+     wanted.push_back({rex::memory::load_and_swap<uint32_t>(c), rex::memory::load_and_swap<uint32_t>(c + 4)});
+   }
+   const bool me_modded = rex::system::online::Modded();
+@@ -268,7 +269,7 @@
+   REXLOG_INFO("LIVE {}: {} advert(s) online, {} match (search contexts:{}; this game {})", what, texts.size(),
+               found.size(), wanted_text, me_modded ? "modded" : "unmodded");
+   if (!results_ptr || buffer_size < 8) return 0;
+-  uint8_t* base = memory->TranslateVirtual<uint8_t*>(results_ptr);
++  uint8_t* base = memory->template TranslateVirtual<uint8_t*>(results_ptr);
+   std::memset(base, 0, buffer_size);
+   uint32_t count = 0;
+   uint32_t tail = buffer_size;  // extra arrays grow down from the end
+@@ -346,7 +347,7 @@
+ //   <players>|<max players>|<0 = in the lobby (joinable), 1 = a match is running,
+ //   2 = searching for players / anything else (joins only work in the lobby)>
+ // Private Parties and modded games never show (fair play, as in the search).
+-extern "C" __declspec(dllexport) int SrPublicLobbies(char* out, int size) {
++SR_NATIVE_EXPORT int SrPublicLobbies(char* out, int size) {
+   if (!out || size <= 1) return 0;
+   std::string text;
+   const auto adverts = rex::system::eoslan::LiveAdverts(0);  // also starts Epic
+@@ -380,7 +381,7 @@
+   return n;
+ }
+ // A on a lobby in MULTIPLAYER > LOBBIES: join that host's session.
+-extern "C" __declspec(dllexport) int SrJoinLobby(const char* session_hex) {
++SR_NATIVE_EXPORT int SrJoinLobby(const char* session_hex) {
+   if (!session_hex) return 0;
+   const std::string want(session_hex);
+   if (want.size() != 120) return 0;
+diff --git a/src/kernel/xam/apps/xlivebase_app.cpp b/src/kernel/xam/apps/xlivebase_app.cpp
+--- a/src/kernel/xam/apps/xlivebase_app.cpp
++++ b/src/kernel/xam/apps/xlivebase_app.cpp
+@@ -1,3 +1,4 @@
++#include <rex/sr_platform_export.h>
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -308,7 +309,7 @@
+ // XInviteSend for the game exe (its wrapper sub_8265BBC0 is replaced there,
+ // project/src/online_players.cpp): user, invitee count, XUID array (guest),
+ // XOVERLAPPED (guest, may be 0). Returns what XInviteSend returns.
+-extern "C" __declspec(dllexport) uint32_t SrLiveInviteSend(uint32_t user, uint32_t count, uint32_t xuids_ptr,
++SR_NATIVE_EXPORT uint32_t SrLiveInviteSend(uint32_t user, uint32_t count, uint32_t xuids_ptr,
+                                                            uint32_t overlapped_ptr) {
+   auto* ks = REX_KERNEL_STATE();
+   if (!ks) return 1627;  // ERROR_FUNCTION_FAILED
+@@ -358,7 +359,7 @@
+ }  // namespace
+ 
+ // XStorageUploadFromMemory(user, server path, size, buffer, XOVERLAPPED)
+-extern "C" __declspec(dllexport) uint32_t SrStorageUpload(uint32_t user, uint32_t path_ptr, uint32_t size,
++SR_NATIVE_EXPORT uint32_t SrStorageUpload(uint32_t user, uint32_t path_ptr, uint32_t size,
+                                                           uint32_t buffer_ptr, uint32_t overlapped_ptr) {
+   auto* ks = REX_KERNEL_STATE();
+   if (!ks || !buffer_ptr || size > (16u << 20)) return 1627;
+@@ -385,7 +386,7 @@
+ // size, XSTORAGE_DOWNLOAD_TO_MEMORY_RESULTS {u32 bytes, u64 owner xuid,
+ // u64 created filetime}, XOVERLAPPED). Nothing stored yet: fails at once
+ // (1627), which the game treats as "no saved character" (defaults).
+-extern "C" __declspec(dllexport) uint32_t SrStorageDownload(uint32_t user, uint32_t path_ptr, uint32_t size,
++SR_NATIVE_EXPORT uint32_t SrStorageDownload(uint32_t user, uint32_t path_ptr, uint32_t size,
+                                                             uint32_t buffer_ptr, uint32_t results_size,
+                                                             uint32_t results_ptr, uint32_t overlapped_ptr) {
+   auto* ks = REX_KERNEL_STATE();
+diff --git a/src/kernel/xam/xam_net.cpp b/src/kernel/xam/xam_net.cpp
+--- a/src/kernel/xam/xam_net.cpp
++++ b/src/kernel/xam/xam_net.cpp
+@@ -87,6 +87,12 @@
+ // The guest call chain of the current import call (return address, then the
+ // saved return addresses up the stack), to tell the game's callers apart.
+ static std::string GuestChain() {
++#if defined(__APPLE__)
++  // Diagnostic-only guest stack walking faults on ARM64 network worker stacks.
++  // It ran on every select/recv, consuming ~48% of sampled CPU on the iPad.
++  // Keep the transport unchanged and avoid dereferencing guest stack links.
++  return "iPad";
++#else
+   auto* ts = rex::runtime::ThreadState::Get();
+   if (!ts || !ts->context()) return "?";
+   auto* ctx = ts->context();
+@@ -105,10 +111,15 @@
+     sp = back;
+   }
+   return out;
++#endif
+ }
+ // Logs a call site (key + call chain) the first time it is seen (at most
+ // `limit` different sites per key).
+ static bool NetLogSite(const char* key, const std::string& chain, int limit = 24) {
++#if defined(__APPLE__)
++  // These call-site diagnostics are desktop debugging, not packet processing.
++  return false;
++#else
+   static std::mutex m;
+   static std::unordered_map<std::string, int> per_key;
+   static std::unordered_map<std::string, bool> seen;
+@@ -119,6 +130,7 @@
+   per_key[key]++;
+   seen[k] = true;
+   return true;
++#endif
+ }
+ static uint16_t g_system_link_port = 0;
+ 
+@@ -350,7 +362,7 @@
+   // messages (a constant 0xBB.. made every game take the others' messages
+   // for its own and ignore them).
+   static std::mutex m;
+-  static std::mt19937_64 rng{std::random_device{}() ^ uint64_t(GetTickCount64()) ^ (uint64_t(GetCurrentProcessId()) << 32)};
++  static std::mt19937_64 rng{std::random_device{}() ^ uint64_t(std::chrono::steady_clock::now().time_since_epoch().count())};
+   std::lock_guard<std::mutex> lock(m);
+   uint8_t* out = buffer_ptr.as<uint8_t*>();
+   for (uint32_t i = 0; i < length; ++i) out[i] = uint8_t(rng() >> 56);
+@@ -1270,15 +1282,25 @@
+     while (true) {
+       fd_set r = native_readfds;
+       bool companion = false;
++      int select_nfds = 0;
++#if !REX_PLATFORM_WIN32
++      for (uint32_t i = 0; i < host_readfds.count; ++i)
++        select_nfds = std::max(select_nfds, int(host_readfds.sockets[i]->native_handle()) + 1);
++#endif
+       for (uint64_t h : BoundDatagramSockets()) {
++#if REX_PLATFORM_WIN32
+         if (r.fd_count >= FD_SETSIZE) break;
+-        if (!FD_ISSET(SOCKET(h), &r)) {
+-          FD_SET(SOCKET(h), &r);
++#else
++        if (h >= FD_SETSIZE) continue;
++        select_nfds = std::max(select_nfds, int(h) + 1);
++#endif
++        if (!FD_ISSET(h, &r)) {
++          FD_SET(h, &r);
+           companion = true;
+         }
+       }
+       timeval slice{0, 250000};
+-      ret = select(0, &r, nullptr, nullptr, &slice);
++      ret = select(select_nfds, &r, nullptr, nullptr, &slice);
+       if (ret < 0) break;
+       if (ret == 0) {
+         GatesTimer();
+@@ -1286,25 +1308,34 @@
+       }
+       bool own = false;
+       for (uint32_t i = 0; i < host_readfds.count; ++i)
+-        own |= FD_ISSET(SOCKET(host_readfds.sockets[i]->native_handle()), &r) != 0;
++        own |= FD_ISSET(host_readfds.sockets[i]->native_handle(), &r) != 0;
+       if (own || !companion) {
+         native_readfds = r;
+         ret = 0;
+         for (uint32_t i = 0; i < host_readfds.count; ++i)
+-          ret += FD_ISSET(SOCKET(host_readfds.sockets[i]->native_handle()), &r) != 0;
++          ret += FD_ISSET(host_readfds.sockets[i]->native_handle(), &r) != 0;
+         break;
+       }
+       // Only another socket has data: let the game read (it reads them all),
+       // at most every 10 ms in case it leaves that data waiting.
+       static std::atomic<uint64_t> last_wake{0};
+-      const uint64_t now = GetTickCount64();
+-      if (now - last_wake < 10) Sleep(10);
+-      last_wake = GetTickCount64();
++      const uint64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
++          std::chrono::steady_clock::now().time_since_epoch()).count();
++      if (now - last_wake < 10) std::this_thread::sleep_for(std::chrono::milliseconds(10));
++      last_wake = std::chrono::duration_cast<std::chrono::milliseconds>(
++          std::chrono::steady_clock::now().time_since_epoch()).count();
+       if (NetLogOnce("select-wake", 10)) REXKRNL_INFO("NET select: woken by data on another UDP socket");
+       ret = int(host_readfds.count);  // native_readfds still holds exactly the waited-on sockets
+       break;
+     }
+   } else {
++#if !REX_PLATFORM_WIN32
++    int host_nfds = 0;
++    for (const auto* set : {&host_readfds, &host_writefds, &host_exceptfds})
++      for (uint32_t i = 0; i < set->count; ++i)
++        host_nfds = std::max(host_nfds, int(set->sockets[i]->native_handle()) + 1);
++    nfds = host_nfds;
++#endif
+     ret = select(nfds, readfds ? &native_readfds : nullptr, writefds ? &native_writefds : nullptr,
+                  exceptfds ? &native_exceptfds : nullptr, timeout_in);
+   }
+@@ -1444,7 +1475,11 @@
+   auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
+   if (!socket || !name) { XThread::SetLastError(0x2736); return -1; }
+   sockaddr_in a{};
++#if REX_PLATFORM_WIN32
+   int len = sizeof(a);
++#else
++  socklen_t len = sizeof(a);
++#endif
+   if (getsockname(socket->native_handle(), (sockaddr*)&a, &len) != 0) return -1;
+   name->sin_family = 2;
+   name->sin_port = ntohs(a.sin_port);
+@@ -1457,8 +1492,12 @@
+                             mapped_void optval_ptr, mapped_u32 optlen_ptr) {
+   auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
+   if (!socket) { XThread::SetLastError(0x2736); return -1; }
++#if REX_PLATFORM_WIN32
+   int len = optlen_ptr ? int(*optlen_ptr) : 0;
+-  std::vector<char> tmp(size_t(std::max(len, 4)), 0);
++#else
++  socklen_t len = optlen_ptr ? socklen_t(*optlen_ptr) : 0;
++#endif
++  std::vector<char> tmp(size_t(std::max(int(len), 4)), 0);
+   if (getsockopt(socket->native_handle(), level, optname, tmp.data(), &len) != 0) {
+     // Unknown to Windows (Xbox-only options): report 0.
+     if (optval_ptr && optlen_ptr && *optlen_ptr >= 4) *reinterpret_cast<rex::be<uint32_t>*>(static_cast<void*>(optval_ptr)) = 0;
+diff --git a/src/system/CMakeLists.txt b/src/system/CMakeLists.txt
+--- a/src/system/CMakeLists.txt
++++ b/src/system/CMakeLists.txt
+@@ -136,3 +136,7 @@
+     )
+     target_compile_definitions(rexruntime PUBLIC REX_HAS_VULKAN=1)
+ endif()
++
++if(APPLE)
++    target_link_libraries(rexruntime PRIVATE "-framework Security" "-framework CoreFoundation")
++endif()
+diff --git a/src/system/gpu_plugin_loader.cpp b/src/system/gpu_plugin_loader.cpp
+--- a/src/system/gpu_plugin_loader.cpp
++++ b/src/system/gpu_plugin_loader.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <rex/system/gpu_plugin.h>
+ 
++#include <TargetConditionals.h>
+ #include <filesystem>
+ #include <string>
+ #include <vector>
+@@ -55,7 +56,11 @@
+ }  // namespace
+ 
+ std::unique_ptr<IGraphicsSystem> LoadGpuPlugin(std::string_view name, std::string_view backend) {
+-  auto path = rex::filesystem::GetExecutableFolder() / PluginFileName(name);
++  auto path = rex::filesystem::GetExecutableFolder()
++#if TARGET_OS_IPHONE
++      / "Frameworks"
++#endif
++      / PluginFileName(name);
+   if (!std::filesystem::exists(path)) {
+     REXSYS_ERROR(
+         "GPU plugin '{}' not found at {}. Stage it next to the executable "
+diff --git a/src/system/online_identity.cpp b/src/system/online_identity.cpp
+--- a/src/system/online_identity.cpp
++++ b/src/system/online_identity.cpp
+@@ -29,9 +29,18 @@
+ #ifndef WIN32_LEAN_AND_MEAN
+ #define WIN32_LEAN_AND_MEAN
+ #endif
++#ifdef _WIN32
+ #include <windows.h>
+ #include <bcrypt.h>
+ #pragma comment(lib, "bcrypt.lib")
++#else
++#include <Security/Security.h>
++#include <CommonCrypto/CommonDigest.h>
++#include <filesystem>
++#include <cstdlib>
++#include <random>
++#include <unistd.h>
++#endif
+ 
+ #include "sr_reserved_names.h"
+ 
+@@ -67,6 +76,7 @@
+ };
+ constexpr char kProofPrefix[] = "SaintsReborn owner v1|";
+ 
++#ifdef _WIN32
+ std::string ExeDir() {
+   char path[MAX_PATH] = {};
+   GetModuleFileNameA(nullptr, path, MAX_PATH);
+@@ -117,6 +127,51 @@
+   BCryptCloseAlgorithmProvider(alg, 0);
+   return ok;
+ }
++
++#else
++// Identity files must live in a writable sandbox directory on iPad.
++std::string ExeDir() {
++  const char* home = std::getenv("HOME");
++  if (!home) throw std::runtime_error("No sandbox home for online identity");
++  std::filesystem::path dir = std::filesystem::path(home) / "Library/Application Support/SaintsRow";
++  std::filesystem::create_directories(dir);
++  return dir.string() + "/";
++}
++bool Verify(const std::string& message, const uint8_t sig[64]) {
++  // Windows uses raw r||s; Apple's ECDSA verifier uses an ASN.1 sequence.
++  std::vector<uint8_t> payload;
++  for (int n = 0; n < 2; ++n) {
++    const uint8_t* integer = sig + n * 32;
++    size_t skip = 0;
++    while (skip < 31 && integer[skip] == 0) ++skip;
++    bool pad = (integer[skip] & 0x80) != 0;
++    payload.push_back(0x02);
++    payload.push_back(uint8_t(32 - skip + (pad ? 1 : 0)));
++    if (pad) payload.push_back(0);
++    payload.insert(payload.end(), integer + skip, integer + 32);
++  }
++  std::vector<uint8_t> der{0x30, uint8_t(payload.size())};
++  der.insert(der.end(), payload.begin(), payload.end());
++  uint8_t point[65] = {0x04};
++  std::memcpy(point + 1, kOwnerPublic + 8, 64);
++  CFDataRef pub = CFDataCreate(nullptr, point, 65);
++  const void* keys[] = {kSecAttrKeyType, kSecAttrKeyClass};
++  const void* values[] = {kSecAttrKeyTypeECSECPrimeRandom, kSecAttrKeyClassPublic};
++  CFDictionaryRef attrs = CFDictionaryCreate(nullptr, keys, values, 2,
++      &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
++  SecKeyRef key = SecKeyCreateWithData(pub, attrs, nullptr);
++  CFRelease(pub); CFRelease(attrs);
++  if (!key) return false;
++  CFDataRef data = CFDataCreate(nullptr, reinterpret_cast<const UInt8*>(message.data()), message.size());
++  CFDataRef signature = CFDataCreate(nullptr, der.data(), der.size());
++  bool ok = SecKeyVerifySignature(key, kSecKeyAlgorithmECDSASignatureMessageX962SHA256, data, signature, nullptr);
++  CFRelease(data); CFRelease(signature); CFRelease(key);
++  return ok;
++}
++// Owner-only private-key signing is not used by normal players. Preserve
++// reserved-name checks without enabling that optional Windows owner feature.
++bool Sign(const std::vector<uint8_t>&, const std::string&, uint8_t[64]) { return false; }
++#endif
+ 
+ std::once_flag g_key_once;
+ std::vector<uint8_t> g_private;  // BCRYPT_ECCPRIVATE_BLOB, only on the owner's PC
+@@ -234,16 +289,24 @@
+     }
+     if (id.size() < 16) {
+       uint8_t rnd[16] = {};
++#ifdef _WIN32
+       if (BCryptGenRandom(nullptr, rnd, sizeof(rnd), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+         const uint64_t t = GetTickCount64() ^ (uint64_t(GetCurrentProcessId()) << 32);
+         std::memcpy(rnd, &t, 8);
+       }
++#else
++      if (SecRandomCopyBytes(kSecRandomDefault, sizeof(rnd), rnd) != errSecSuccess) {
++        std::random_device source;
++        for (auto& byte : rnd) byte = uint8_t(source());
++      }
++#endif
+       id = Hex(rnd, sizeof(rnd));
+       if (FILE* f = std::fopen(path.c_str(), "wb")) {
+         std::fwrite(id.data(), 1, id.size(), f);
+         std::fclose(f);
+       }
+     }
++#ifdef _WIN32
+     char pc[MAX_COMPUTERNAME_LENGTH + 1] = {};
+     DWORD pc_n = sizeof(pc);
+     GetComputerNameA(pc, &pc_n);
+@@ -251,6 +314,9 @@
+     DWORD user_n = 0;
+     if (const DWORD got = GetEnvironmentVariableA("USERNAME", user, sizeof(user)); got && got < sizeof(user)) user_n = got;
+     const std::string key = "saintsreborn-xuid|" + id + "|" + std::string(pc, pc_n) + "|" + std::string(user, user_n);
++#else
++    const std::string key = "saintsreborn-xuid|" + id;
++#endif
+     uint64_t h = 1469598103934665603ull;
+     for (char c : key) { h ^= uint8_t(c); h *= 1099511628211ull; }
+     // 0x0009 = online (Live) XUID range, like the friend list XUIDs.
+diff --git a/src/system/xsocket.cpp b/src/system/xsocket.cpp
+--- a/src/system/xsocket.cpp
++++ b/src/system/xsocket.cpp
+@@ -33,6 +33,8 @@
+ #include <WS2tcpip.h>
+ #else
+ #include <arpa/inet.h>
++#include <netdb.h>
++#include <unistd.h>
+ #include <netinet/in.h>
+ #include <netinet/ip.h>
+ #include <sys/socket.h>
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -489,6 +489,9 @@
+       WaitForUITickFromUIThread();
+ 
+       paint_result = PaintAndPresent(draw_ui);
++      if (paint_result == PaintResult::kNotPresentedGpuBusy) {
++        request_repaint_at_tick = true;
++      }
+       if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
+         // Request another PaintFromUIThread which will try to recover from the
+         // outdated connection in the next frame (not immediately, so the
+diff --git a/src/ui/vulkan/vulkan_moltenvk.cpp b/src/ui/vulkan/vulkan_moltenvk.cpp
+--- a/src/ui/vulkan/vulkan_moltenvk.cpp
++++ b/src/ui/vulkan/vulkan_moltenvk.cpp
+@@ -30,11 +30,11 @@
+ namespace fs = std::filesystem;
+ 
+ constexpr std::array<std::string_view, 2> kRootSuffixes = {".", "macOS"};
+-constexpr std::array<std::string_view, 3> kRootMarkers = {
+-    "lib/libvulkan.1.dylib", "Frameworks/vulkan.framework/vulkan", "lib/libMoltenVK.dylib"};
+-constexpr std::array<std::string_view, 4> kLoaderFiles = {
++constexpr std::array<std::string_view, 4> kRootMarkers = {
++    "lib/libvulkan.1.dylib", "Frameworks/vulkan.framework/vulkan", "lib/libMoltenVK.dylib", "Frameworks/libMoltenVK.dylib"};
++constexpr std::array<std::string_view, 5> kLoaderFiles = {
+     "lib/libvulkan.1.dylib", "lib/libvulkan.dylib", "Frameworks/vulkan.framework/vulkan",
+-    "lib/libMoltenVK.dylib"};
++    "lib/libMoltenVK.dylib", "Frameworks/libMoltenVK.dylib"};
+ constexpr std::array<std::string_view, 2> kSpirvToolsFiles = {
+     "lib/libSPIRV-Tools-shared.dylib", "Frameworks/libSPIRV-Tools-shared.dylib"};
+ constexpr std::array<std::string_view, 3> kIcdFiles = {"share/vulkan/icd.d/MoltenVK_icd.json",
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -9,6 +9,9 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#if defined(__APPLE__)
++#include <TargetConditionals.h>
++#endif
+ #include <algorithm>
+ #include <atomic>
+ #include <cstddef>
+@@ -1534,6 +1537,15 @@
+   uint64_t current_paint_submission_index =
+       paint_context_.submission_tracker.GetCurrentSubmission();
+   uint64_t paint_submission_count = uint64_t(paint_context_.submissions.size());
++#if defined(__APPLE__) && TARGET_OS_IPHONE
++  // UIKit must keep servicing controller/lifecycle events during slow GPU
++  // frames. Query fences before entering any wait/recycling paint resources.
++  // A busy result posts a retry for the next bounded SDL/UI pump tick.
++  if (paint_context_.submission_tracker.UpdateAndGetCompletedSubmission() <
++      current_paint_submission_index - 1) {
++    return PaintResult::kNotPresentedGpuBusy;
++  }
++#endif
+   if (current_paint_submission_index >= paint_submission_count) {
+     paint_context_.submission_tracker.AwaitSubmissionCompletion(current_paint_submission_index -
+                                                                 paint_submission_count);
+@@ -1569,10 +1581,18 @@
+ 
+   VkSemaphore acquire_semaphore = paint_submission.acquire_semaphore();
+   uint32_t swapchain_image_index;
++#if defined(__APPLE__) && TARGET_OS_IPHONE
++  constexpr uint64_t acquire_timeout = 0;
++#else
++  constexpr uint64_t acquire_timeout = UINT64_MAX;
++#endif
+   VkResult acquire_result =
+-      dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
++      dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, acquire_timeout, acquire_semaphore,
+                                 VK_NULL_HANDLE, &swapchain_image_index);
+   switch (acquire_result) {
++    case VK_NOT_READY:
++    case VK_TIMEOUT:
++      return PaintResult::kNotPresentedGpuBusy;
+     case VK_SUCCESS:
+     case VK_SUBOPTIMAL_KHR:
+       break;
+diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
+--- a/src/ui/window_sdl.cpp
++++ b/src/ui/window_sdl.cpp
+@@ -11,6 +11,7 @@
+  * @remarks     Derived from Xenia's window_win.cc (Ben Vanik, 2020).
+  */
+ 
++#include <TargetConditionals.h>
+ #include <rex/ui/window_sdl.h>
+ 
+ #include <algorithm>
+@@ -136,7 +137,10 @@
+ bool WindowSDL::OpenImpl() {
+   // SDL window coordinates are physical pixels on Windows and X11. Cocoa
+   // uses logical points and applies the backing scale itself.
+-  SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN;
++  SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN;
++#if !TARGET_OS_IPHONE
++  flags |= SDL_WINDOW_HIGH_PIXEL_DENSITY;
++#endif
+ #if REX_PLATFORM_MAC
+   int initial_width = int(GetDesiredLogicalWidth());
+   int initial_height = int(GetDesiredLogicalHeight());
+@@ -235,6 +239,8 @@
+   }
+   return SDL_GetPointerProperty(SDL_GetWindowProperties(sdl_window_),
+                                 SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
++#elif TARGET_OS_IPHONE
++  return sdl_window_;
+ #else
+   return nullptr;
+ #endif
+diff --git a/src/ui/windowed_app_context_sdl.cpp b/src/ui/windowed_app_context_sdl.cpp
+--- a/src/ui/windowed_app_context_sdl.cpp
++++ b/src/ui/windowed_app_context_sdl.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <rex/ui/windowed_app_context_sdl.h>
+ 
++#include <TargetConditionals.h>
+ #include <cstdlib>
+ #include <string>
+ #include <vector>
+@@ -44,7 +45,11 @@
+ #if REX_PLATFORM_MAC
+   // macOS presents via a CAMetalLayer surface obtained from the Cocoa driver.
+   if (requested_driver.empty()) {
++    #if TARGET_OS_IPHONE
++    requested_driver = "uikit";
++#else
+     requested_driver = "cocoa";
++#endif
+   }
+ #endif
+   if (!requested_driver.empty()) {
+@@ -82,6 +87,18 @@
+   // RunMainMessageLoop re-checks HasQuitFromUIThread after every event; a
+   // wakeup guarantees SDL_WaitEvent returns promptly if the queue is empty.
+   NotifyUILoopOfPendingFunctions();
++}
++
++void SDLWindowedAppContext::PumpEvents() {
++  SDL_Event event;
++  // A continuously repainting game can replenish this queue while it is
++  // drained. Yield to UIKit after one paint so touch/lifecycle events run.
++  for (int processed = 0; processed < 32 && SDL_PollEvent(&event); ++processed) {
++    const bool painted = event.type == paint_event_type_;
++    ProcessEvent(event);
++    if (painted) break;
++  }
++  ExecutePendingFunctionsFromUIThread();
+ }
+ 
+ int SDLWindowedAppContext::RunMainMessageLoop() {

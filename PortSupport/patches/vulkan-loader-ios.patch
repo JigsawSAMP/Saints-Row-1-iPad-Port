@@ -1,0 +1,13 @@
+diff --git a/loader/CMakeLists.txt b/loader/CMakeLists.txt
+index 46f83d0..2af721f 100644
+--- a/loader/CMakeLists.txt
++++ b/loader/CMakeLists.txt
+@@ -275,7 +275,7 @@ elseif(UNIX OR MINGW OR (WIN32 AND USE_GAS)) # i.e.: Linux & Apple & MinGW & Win
+         set(CMAKE_ASM_FLAGS "${CMAKE_C_FLAGS}")
+         set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+ 
+-        if(WIN32 AND ${SYSTEM_PROCESSOR} MATCHES "arm64")
++        if(WIN32 AND "${SYSTEM_PROCESSOR}" MATCHES "arm64")
+             # In this particular case, we are using the same approach as for NASM
+             # This specifically avoids CMake issue #18889
+             execute_process(COMMAND ${CMAKE_ASM_COMPILER} ${CMAKE_ASM_FLAGS} -c -o ${CMAKE_CURRENT_BINARY_DIR}/asm_test_aarch64.obj ${CMAKE_CURRENT_SOURCE_DIR}/asm_test_aarch64.S
